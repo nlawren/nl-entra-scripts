@@ -3,7 +3,11 @@ name = "entra-scripts"
 version = "0.1.0"
 description = "Standalone read-only Entra scripts"
 requires-python = ">=3.14"
-dependencies = ["requests>=2.34"]
+dependencies = [
+    "azure-identity",
+    "requests",
+    "xlsxwriter",
+    ]
 
 [dependency-groups]
 dev = ["ruff", "ty"]
