@@ -102,7 +102,7 @@ def fetch_users(session: requests.Session, ids: list[str]) -> dict[str, dict[str
     user is looked up individually; batching keeps that to one call per 20.
     """
     users: dict[str, dict[str, Any]] = {}
-    for chunk in batched(ids, BATCH_SIZE):
+    for chunk in batched(ids, BATCH_SIZE, strict=False):
         pending = {
             str(i): {"id": str(i), "method": "GET", "url": f"/users/{uid}?$select={USER_SELECT}"}
             for i, uid in enumerate(chunk)
