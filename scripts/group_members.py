@@ -183,10 +183,7 @@ def write_xlsx(rows: list[dict[str, Any]], output: Path) -> None:
         ws = wb.add_worksheet("Members")
         # Real dates so Excel sorts and filters them by date, not as text.
         date_fmt = wb.add_format({"num_format": "yyyy-mm-dd"})
-        columns = [
-            {"header": c, "format": date_fmt} if c == "lastSignInDate" else {"header": c}
-            for c in COLUMNS
-        ]
+        columns = [{"header": c, "format": date_fmt} if c == "lastSignInDate" else {"header": c} for c in COLUMNS]
         ws.add_table(
             0,
             0,
