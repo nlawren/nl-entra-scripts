@@ -14,11 +14,15 @@ Usage:
     uv run group_members.py "My Group" --format csv
     uv run group_members.py 0638c5e9-1424-4da6-9538-a4f8ea8799ac -o members.xlsx
 
-Auth uses DefaultAzureCredential: `az login` locally, the AzureCLI@2 task's
-service connection in a pipeline, or AZURE_CLIENT_ID/SECRET/TENANT_ID env vars.
+Auth uses the Azure CLI's signed-in account, so run `az login` first.
 
-Permissions: GroupMember.Read.All, User.Read.All and AuditLog.Read.All
-(sign-in activity also needs an Entra ID P1/P2 licence in the tenant).
+Permissions: GroupMember.Read.All, User.Read.All and AuditLog.Read.All.
+Sign-in activity also needs an Entra ID P1/P2 licence in the tenant and a
+directory role such as Reports Reader, Security Reader or Global Reader; without
+them the export still runs, but lastSignInDate is left blank.
+
+lastSignInDate is the last *successful* sign-in, which Entra has only recorded
+since December 2023, so accounts not used since then show blank.
 """
 
 from __future__ import annotations
@@ -32,14 +36,15 @@ from datetime import date, datetime
 from itertools import batched
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import requests
-from azure.identity import DefaultAzureCredential
+from azure.identity import AzureCliCredential
 from xlsxwriter import Workbook
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterator, Mapping
 
 GRAPH = "https://graph.microsoft.com/v1.0"
 SCOPE = "https://graph.microsoft.com/.default"
@@ -47,7 +52,8 @@ TIMEOUT = 30
 BATCH_SIZE = 20  # Graph $batch maximum
 LOCAL_TZ = ZoneInfo("Australia/Sydney")
 GUID_RE = re.compile(r"^[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}$", re.IGNORECASE)
-USER_SELECT = "id,displayName,userPrincipalName,mail,userType,accountEnabled,signInActivity"
+USER_SELECT_BASIC = "id,displayName,userPrincipalName,mail,userType,accountEnabled"
+USER_SELECT = f"{USER_SELECT_BASIC},signInActivity"
 COLUMNS = [
     "type",
     "displayName",
@@ -58,25 +64,44 @@ COLUMNS = [
     "lastSignInDate",
     "id",
 ]
-HTTP_TOO_MANY = 429
+HTTP_FORBIDDEN = 403
+RETRY_STATUSES = frozenset({429, 503, 504})  # throttled or transient
+DEFAULT_RETRY_SECONDS = 5
+MAX_ATTEMPTS = 6
 MAX_COL_PIXELS = 400
 
 
 def graph_session() -> requests.Session:
     """Return a requests session carrying a Graph bearer token."""
-    token = DefaultAzureCredential().get_token(SCOPE).token
+    token = AzureCliCredential().get_token(SCOPE).token
     session = requests.Session()
     session.headers.update({"Authorization": f"Bearer {token}"})
     return session
+
+
+def retry_delay(headers: Mapping[str, str] | None) -> int:
+    """Return the Retry-After delay in seconds, or a default if absent."""
+    return int((headers or {}).get("Retry-After", DEFAULT_RETRY_SECONDS))
+
+
+def send(session: requests.Session, method: str, url: str, **kwargs: Any) -> requests.Response:  # noqa: ANN401
+    """Send a Graph request, retrying throttled and transient failures."""
+    for _ in range(MAX_ATTEMPTS - 1):
+        resp = session.request(method, url, timeout=TIMEOUT, **kwargs)
+        if resp.status_code not in RETRY_STATUSES:
+            break
+        time.sleep(retry_delay(resp.headers))
+    else:
+        resp = session.request(method, url, timeout=TIMEOUT, **kwargs)
+    resp.raise_for_status()
+    return resp
 
 
 def paged(session: requests.Session, url: str) -> Iterator[dict[str, Any]]:
     """Yield every item from a Graph collection, following @odata.nextLink."""
     next_url: str | None = url
     while next_url:
-        resp = session.get(next_url, timeout=TIMEOUT)
-        resp.raise_for_status()
-        body = resp.json()
+        body = send(session, "GET", next_url).json()
         yield from body.get("value", [])
         next_url = body.get("@odata.nextLink")
 
@@ -85,10 +110,9 @@ def resolve_group_id(session: requests.Session, group: str) -> str:
     """Accept a group object ID or an exact display name and return the ID."""
     if GUID_RE.match(group):
         return group
-    safe = group.replace("'", "''")
-    matches = list(
-        paged(session, f"{GRAPH}/groups?$filter=displayName eq '{safe}'&$select=id"),
-    )
+    # Encode the whole filter so &, + and # in a name can't break the query string.
+    odata_filter = quote("displayName eq '{}'".format(group.replace("'", "''")), safe="")
+    matches = list(paged(session, f"{GRAPH}/groups?$filter={odata_filter}&$select=id"))
     if len(matches) != 1:
         msg = f"Expected exactly one group named {group!r}, found {len(matches)}"
         raise SystemExit(msg)
@@ -100,34 +124,52 @@ def fetch_users(session: requests.Session, ids: list[str]) -> dict[str, dict[str
 
     signInActivity can't be selected on the group members endpoint, so each
     user is looked up individually; batching keeps that to one call per 20.
+
+    Graph rejects the whole lookup with 403 if signInActivity isn't allowed
+    (no P1/P2 licence, permission or role), so on the first 403 this drops
+    signInActivity for the rest of the run rather than losing every user.
     """
     users: dict[str, dict[str, Any]] = {}
+    select = USER_SELECT
     for chunk in batched(ids, BATCH_SIZE, strict=False):
-        pending = {
-            str(i): {"id": str(i), "method": "GET", "url": f"/users/{uid}?$select={USER_SELECT}"}
-            for i, uid in enumerate(chunk)
-        }
-        while pending:
-            resp = session.post(
-                f"{GRAPH}/$batch",
-                json={"requests": list(pending.values())},
-                timeout=TIMEOUT,
-            )
-            resp.raise_for_status()
-            retry_after = 0
-            for r in resp.json()["responses"]:
-                if r["status"] == HTTP_TOO_MANY:
-                    retry_after = max(retry_after, int(r["headers"].get("Retry-After", 5)))
-                    continue
-                pending.pop(r["id"])
-                if r["status"] == requests.codes.ok:
-                    users[r["body"]["id"]] = r["body"]
-                else:
-                    err = r["body"].get("error", {}).get("message", r["status"])
-                    print(f"Warning: user lookup failed: {err}", file=sys.stderr)  # noqa: T201
-            if pending:
-                time.sleep(retry_after)
+        select = fetch_chunk(session, chunk, select, users)
     return users
+
+
+def fetch_chunk(
+    session: requests.Session,
+    chunk: tuple[str, ...],
+    select: str,
+    users: dict[str, dict[str, Any]],
+) -> str:
+    """Look up one $batch of users into `users`; return the $select to use next."""
+    pending = {str(i): uid for i, uid in enumerate(chunk)}
+    for _ in range(MAX_ATTEMPTS):
+        batch = [{"id": k, "method": "GET", "url": f"/users/{uid}?$select={select}"} for k, uid in pending.items()]
+        resp = send(session, "POST", f"{GRAPH}/$batch", json={"requests": batch})
+        retry_after = 0
+        denied = ""
+        for r in resp.json()["responses"]:
+            body = r.get("body") or {}
+            err = body.get("error", {}).get("message", r["status"])
+            if r["status"] in RETRY_STATUSES:
+                retry_after = max(retry_after, retry_delay(r.get("headers")))
+            elif r["status"] == HTTP_FORBIDDEN and select == USER_SELECT:
+                denied = err  # left pending, retried without signInActivity
+            elif r["status"] == requests.codes.ok:
+                pending.pop(r["id"])
+                users[body["id"]] = body
+            else:
+                pending.pop(r["id"])
+                print(f"Warning: user lookup failed: {err}", file=sys.stderr)  # noqa: T201
+        if denied:
+            select = USER_SELECT_BASIC
+            print(f"Warning: no sign-in activity, lastSignInDate left blank: {denied}", file=sys.stderr)  # noqa: T201
+        if not pending:
+            return select
+        time.sleep(retry_after)
+    print(f"Warning: {len(pending)} user lookups still throttled, giving up", file=sys.stderr)  # noqa: T201
+    return select
 
 
 def sign_in_date(user: dict[str, Any]) -> date | None:
@@ -171,7 +213,8 @@ def build_rows(
 
 def write_csv(rows: list[dict[str, Any]], output: Path) -> None:
     """Write rows as plain CSV (dates as YYYY-MM-DD)."""
-    with output.open("w", newline="", encoding="utf-8") as f:
+    # BOM so Excel reads the file as UTF-8 and doesn't garble non-ASCII names.
+    with output.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
