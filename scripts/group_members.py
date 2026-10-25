@@ -28,7 +28,9 @@ since December 2023, so accounts not used since then show blank.
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
+import json
 import re
 import sys
 import time
@@ -69,11 +71,26 @@ RETRY_STATUSES = frozenset({429, 503, 504})  # throttled or transient
 DEFAULT_RETRY_SECONDS = 5
 MAX_ATTEMPTS = 6
 MAX_COL_PIXELS = 400
+PROGRESS_EVERY = 10  # batches between user lookup progress lines
+
+
+def log(msg: str) -> None:
+    """Print a timestamped progress line to stderr, keeping stdout clean."""
+    print(f"{time.strftime('%H:%M:%S')} {msg}", file=sys.stderr)  # noqa: T201
+
+
+def token_identity(token: str) -> str:
+    """Return the account and tenant a JWT was issued for, for display only."""
+    payload = token.split(".")[1]
+    claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    account = claims.get("upn") or claims.get("unique_name") or claims.get("appid", "unknown")
+    return f"{account} (tenant {claims.get('tid', 'unknown')})"
 
 
 def graph_session() -> requests.Session:
     """Return a requests session carrying a Graph bearer token."""
     token = AzureCliCredential().get_token(SCOPE).token
+    log(f"Authenticated as {token_identity(token)}")
     session = requests.Session()
     session.headers.update({"Authorization": f"Bearer {token}"})
     return session
@@ -106,17 +123,17 @@ def paged(session: requests.Session, url: str) -> Iterator[dict[str, Any]]:
         next_url = body.get("@odata.nextLink")
 
 
-def resolve_group_id(session: requests.Session, group: str) -> str:
-    """Accept a group object ID or an exact display name and return the ID."""
+def resolve_group(session: requests.Session, group: str) -> dict[str, Any]:
+    """Accept a group object ID or an exact display name and return its id and displayName."""
     if GUID_RE.match(group):
-        return group
+        return send(session, "GET", f"{GRAPH}/groups/{group}?$select=id,displayName").json()
     # Encode the whole filter so &, + and # in a name can't break the query string.
     odata_filter = quote("displayName eq '{}'".format(group.replace("'", "''")), safe="")
-    matches = list(paged(session, f"{GRAPH}/groups?$filter={odata_filter}&$select=id"))
+    matches = list(paged(session, f"{GRAPH}/groups?$filter={odata_filter}&$select=id,displayName"))
     if len(matches) != 1:
         msg = f"Expected exactly one group named {group!r}, found {len(matches)}"
         raise SystemExit(msg)
-    return matches[0]["id"]
+    return matches[0]
 
 
 def fetch_users(session: requests.Session, ids: list[str]) -> dict[str, dict[str, Any]]:
@@ -131,8 +148,11 @@ def fetch_users(session: requests.Session, ids: list[str]) -> dict[str, dict[str
     """
     users: dict[str, dict[str, Any]] = {}
     select = USER_SELECT
-    for chunk in batched(ids, BATCH_SIZE, strict=False):
+    log(f"Looking up details for {len(ids)} users")
+    for n, chunk in enumerate(batched(ids, BATCH_SIZE, strict=False), start=1):
         select = fetch_chunk(session, chunk, select, users)
+        if n % PROGRESS_EVERY == 0:
+            log(f"  {min(n * BATCH_SIZE, len(ids))}/{len(ids)} users looked up")
     return users
 
 
@@ -161,14 +181,15 @@ def fetch_chunk(
                 users[body["id"]] = body
             else:
                 pending.pop(r["id"])
-                print(f"Warning: user lookup failed: {err}", file=sys.stderr)  # noqa: T201
+                log(f"Warning: user lookup failed: {err}")
         if denied:
             select = USER_SELECT_BASIC
-            print(f"Warning: no sign-in activity, lastSignInDate left blank: {denied}", file=sys.stderr)  # noqa: T201
+            log(f"Warning: no sign-in activity, lastSignInDate left blank: {denied}")
         if not pending:
             return select
+        log(f"Throttled by Graph, waiting {retry_after}s")
         time.sleep(retry_after)
-    print(f"Warning: {len(pending)} user lookups still throttled, giving up", file=sys.stderr)  # noqa: T201
+    log(f"Warning: {len(pending)} user lookups still throttled, giving up")
     return select
 
 
@@ -192,6 +213,8 @@ def build_rows(
     members = list(paged(session, url))
 
     user_ids = [m["id"] for m in members if m.get("@odata.type") == "#microsoft.graph.user"]
+    others = len(members) - len(user_ids)
+    log(f"Found {len(members)} {'transitive ' if transitive else ''}members: {len(user_ids)} users, {others} other")
     users = fetch_users(session, user_ids)
 
     rows = []
@@ -261,9 +284,12 @@ def main() -> None:
     parser.add_argument("-o", "--output", type=Path, help="Output file path")
     args = parser.parse_args()
 
+    started = time.monotonic()
+    log(f"Started: exporting members of {args.group!r}")
     session = graph_session()
-    group_id = resolve_group_id(session, args.group)
-    rows = build_rows(session, group_id, transitive=args.transitive)
+    group = resolve_group(session, args.group)
+    log(f"Found group {group['displayName']!r} ({group['id']})")
+    rows = build_rows(session, group["id"], transitive=args.transitive)
 
     stem = re.sub(r"[^\w-]+", "_", args.group)
     output: Path = args.output or Path(f"{stem}_members.{args.format}")
@@ -272,7 +298,7 @@ def main() -> None:
     else:
         write_xlsx(rows, output)
 
-    print(f"Wrote {len(rows)} members to {output}", file=sys.stderr)  # noqa: T201
+    log(f"Wrote {len(rows)} members to {output} in {time.monotonic() - started:.1f}s")
 
 
 if __name__ == "__main__":
