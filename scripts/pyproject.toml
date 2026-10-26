@@ -6,8 +6,10 @@ requires-python = ">=3.14"
 dependencies = [
     "azure-identity",
     "requests",
+    "rich",
+    "rich-argparse",
     "xlsxwriter",
-    ]
+]
 
 [dependency-groups]
 dev = ["ruff", "ty"]
