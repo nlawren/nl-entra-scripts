@@ -3,6 +3,8 @@
 # dependencies = [
 #     "azure-identity",
 #     "requests",
+#     "rich",
+#     "rich-argparse",
 #     "xlsxwriter",
 # ]
 #
@@ -11,7 +13,7 @@
 # ///
 """Export Entra ID guest users from one email domain to Excel (default) or CSV via Microsoft Graph.
 
-Usage:
+Example runs:
     uv run guest_users.py removed.example.com
     uv run guest_users.py removed.example.com --format csv
     uv run guest_users.py removed.example.com -o guests.xlsx
@@ -27,7 +29,6 @@ the domain. Subdomains don't match: example.com won't match a.example.com.
 
 from __future__ import annotations
 
-import argparse
 import re
 import time
 from pathlib import Path
@@ -38,17 +39,24 @@ from group_members import (
     COLUMNS,
     GRAPH,
     HTTP_FORBIDDEN,
+    PROGRESS,
     USER_SELECT,
     USER_SELECT_BASIC,
+    add_output_args,
+    graph_error,
     graph_session,
     log,
+    make_parser,
     paged,
+    running,
+    send,
     sign_in_date,
-    write_csv,
-    write_xlsx,
+    summarise,
+    warn,
+    write_output,
 )
 
-PROGRESS_EVERY = 5000  # guests scanned between progress lines
+GUEST_FILTER = "userType eq 'Guest'"
 
 
 def in_domain(user: dict[str, Any], domain: str) -> bool:
@@ -60,30 +68,55 @@ def in_domain(user: dict[str, Any], domain: str) -> bool:
     return mail.endswith(f"@{domain}") or external.endswith(f"_{domain}")
 
 
-def list_guests(session: requests.Session, select: str) -> list[dict[str, Any]]:
+def count_guests(session: requests.Session) -> int | None:
+    """Return the tenant's guest count for the progress bar, or None if unavailable.
+
+    $count is an advanced query, so it's approximate (eventually consistent).
+    """
+    try:
+        resp = send(
+            session,
+            "GET",
+            f"{GRAPH}/users/$count?$filter={GUEST_FILTER}",
+            headers={"ConsistencyLevel": "eventual"},
+        )
+        return int(resp.text)
+    except requests.HTTPError, ValueError:
+        return None
+
+
+def list_guests(session: requests.Session, select: str, total: int | None) -> list[dict[str, Any]]:
     """Return every guest user in the tenant with the given $select."""
-    url = f"{GRAPH}/users?$filter=userType eq 'Guest'&$select={select}&$top=999"
+    url = f"{GRAPH}/users?$filter={GUEST_FILTER}&$select={select}&$top=999"
+    task = PROGRESS.add_task("Scanning guests", total=total)
     guests = []
-    for n, user in enumerate(paged(session, url), start=1):
-        guests.append(user)
-        if n % PROGRESS_EVERY == 0:
-            log(f"  {n} guests scanned")
+    try:
+        for user in paged(session, url):
+            guests.append(user)
+            PROGRESS.advance(task)
+    except BaseException:
+        PROGRESS.remove_task(task)
+        raise
+    PROGRESS.update(task, total=len(guests), completed=len(guests))  # the count was approximate
     return guests
 
 
-def fetch_guests(session: requests.Session) -> list[dict[str, Any]]:
+def fetch_guests(session: requests.Session) -> tuple[list[dict[str, Any]], bool]:
     """List all guests, dropping signInActivity if Graph won't return it.
 
     Graph rejects the whole listing with 403 if signInActivity isn't allowed
     (no P1/P2 licence, permission or role), so retry once without it.
+
+    Returns the guests and whether sign-in activity was available.
     """
+    total = count_guests(session)
     try:
-        return list_guests(session, USER_SELECT)
+        return list_guests(session, USER_SELECT, total), True
     except requests.HTTPError as e:
         if e.response is None or e.response.status_code != HTTP_FORBIDDEN:
             raise
-        log(f"Warning: no sign-in activity, lastSignInDate left blank: {e.response.text}")
-        return list_guests(session, USER_SELECT_BASIC)
+        warn(f"no sign-in activity, lastSignInDate left blank: {graph_error(e)}")
+        return list_guests(session, USER_SELECT_BASIC, total), False
 
 
 def build_rows(guests: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -105,34 +138,26 @@ def build_rows(guests: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def main() -> None:
     """Parse arguments and write the export."""
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = make_parser(__doc__)
     parser.add_argument("domain", help="Email domain, e.g. removed.example.com")
-    parser.add_argument(
-        "--format",
-        choices=["xlsx", "csv"],
-        default="xlsx",
-        help="Output format (default: xlsx)",
-    )
-    parser.add_argument("-o", "--output", type=Path, help="Output file path")
+    add_output_args(parser)
     args = parser.parse_args()
     domain = args.domain.removeprefix("@").casefold()
 
     started = time.monotonic()
     log(f"Started: exporting guests from {domain!r}")
-    session = graph_session()
-    guests = fetch_guests(session)
+    with running():
+        session = graph_session()
+        guests, sign_ins = fetch_guests(session)
     matches = [g for g in guests if in_domain(g, domain)]
     log(f"Scanned {len(guests)} guests, {len(matches)} from {domain!r}")
     rows = build_rows(matches)
 
     stem = re.sub(r"[^\w-]+", "_", domain)
     output: Path = args.output or Path(f"{stem}_guests.{args.format}")
-    if args.format == "csv":
-        write_csv(rows, output)
-    else:
-        write_xlsx(rows, output)
-
-    log(f"Wrote {len(rows)} guests to {output} in {time.monotonic() - started:.1f}s")
+    write_output(rows, output, args.format)
+    log(f"Wrote {len(rows)} guests to {output}", style="green")
+    summarise(rows, noun="guests", sign_ins=sign_ins, started=started)
 
 
 if __name__ == "__main__":

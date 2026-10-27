@@ -3,12 +3,14 @@
 # dependencies = [
 #     "azure-identity",
 #     "requests",
+#     "rich",
+#     "rich-argparse",
 #     "xlsxwriter",
 # ]
 # ///
 """Export Entra ID group membership to Excel (default) or CSV via Microsoft Graph.
 
-Usage:
+Example runs:
     uv run group_members.py "My Group"
     uv run group_members.py "My Group" --transitive
     uv run group_members.py "My Group" --format csv
@@ -31,22 +33,30 @@ import argparse
 import base64
 import csv
 import json
+import logging
 import re
 import sys
 import time
+from contextlib import contextmanager
 from datetime import date, datetime
 from itertools import batched
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import requests
+from azure.core.exceptions import ClientAuthenticationError
 from azure.identity import AzureCliCredential
+from rich.console import Console
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.table import Table
+from rich.theme import Theme
+from rich_argparse import RawDescriptionRichHelpFormatter
 from xlsxwriter import Workbook
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping
+    from collections.abc import Generator, Iterator, Mapping
 
 GRAPH = "https://graph.microsoft.com/v1.0"
 SCOPE = "https://graph.microsoft.com/.default"
@@ -71,12 +81,79 @@ RETRY_STATUSES = frozenset({429, 503, 504})  # throttled or transient
 DEFAULT_RETRY_SECONDS = 5
 MAX_ATTEMPTS = 6
 MAX_COL_PIXELS = 400
-PROGRESS_EVERY = 10  # batches between user lookup progress lines
+
+# Everything goes to stderr, keeping stdout clean. Colour and live progress
+# switch themselves off when stderr isn't a terminal (piped or redirected).
+# Timestamps in the normal text colour: rich's dim cyan is near-unreadable on dark themes.
+CONSOLE = Console(stderr=True, log_path=False, log_time_format="%H:%M:%S", theme=Theme({"log.time": "default"}))
+PROGRESS = Progress(
+    SpinnerColumn(),
+    TextColumn("{task.description}"),
+    BarColumn(),
+    MofNCompleteColumn(),
+    TimeElapsedColumn(),
+    console=CONSOLE,
+)
+# azure-identity logs its own warning on a failed sign-in; graph_session reports it instead.
+logging.getLogger("azure.identity").setLevel(logging.ERROR)
 
 
-def log(msg: str) -> None:
-    """Print a timestamped progress line to stderr, keeping stdout clean."""
-    print(f"{time.strftime('%H:%M:%S')} {msg}", file=sys.stderr)  # noqa: T201
+def log(msg: str, style: str | None = None) -> None:
+    """Print a timestamped progress line; markup off so names can't break it."""
+    if CONSOLE.is_terminal:
+        CONSOLE.log(msg, style=style, markup=False)
+    else:
+        # Plain lines when piped: rich would wrap and pad them to 80 columns.
+        print(f"{time.strftime('%H:%M:%S')} {msg}", file=sys.stderr)  # noqa: T201
+
+
+def warn(msg: str) -> None:
+    """Log a warning in yellow."""
+    log(f"Warning: {msg}", style="yellow")
+
+
+def fail(msg: str) -> NoReturn:
+    """Log an error in red and exit with status 1."""
+    log(f"Error: {msg}", style="bold red")
+    sys.exit(1)
+
+
+def graph_error(e: requests.HTTPError) -> str:
+    """Return Graph's own message for a failed request."""
+    resp = e.response
+    if resp is None:
+        return str(e)
+    try:
+        detail = resp.json()["error"]["message"]
+    except ValueError, KeyError:
+        detail = resp.text
+    return f"Graph returned {resp.status_code} {resp.reason}: {detail}"
+
+
+@contextmanager
+def running() -> Generator[None]:
+    """Show live progress for the run and report Graph failures cleanly."""
+    with PROGRESS:
+        try:
+            yield
+        except requests.HTTPError as e:
+            fail(graph_error(e))
+
+
+def make_parser(doc: str) -> argparse.ArgumentParser:
+    """Return a parser whose --help shows the script's docstring, in colour."""
+    return argparse.ArgumentParser(description=doc, formatter_class=RawDescriptionRichHelpFormatter)
+
+
+def add_output_args(parser: argparse.ArgumentParser) -> None:
+    """Add the --format and --output options shared by every export."""
+    parser.add_argument(
+        "--format",
+        choices=["xlsx", "csv"],
+        default="xlsx",
+        help="Output format (default: %(default)s)",
+    )
+    parser.add_argument("-o", "--output", type=Path, help="Output file path (default: named after the input)")
 
 
 def token_identity(token: str) -> str:
@@ -89,8 +166,11 @@ def token_identity(token: str) -> str:
 
 def graph_session() -> requests.Session:
     """Return a requests session carrying a Graph bearer token."""
-    token = AzureCliCredential().get_token(SCOPE).token
-    log(f"Authenticated as {token_identity(token)}")
+    try:
+        token = AzureCliCredential().get_token(SCOPE).token
+    except ClientAuthenticationError as e:
+        fail(f"Azure CLI sign-in failed, run `az login` first: {str(e).splitlines()[0]}")
+    log(f"Authenticated as {token_identity(token)}", style="green")
     session = requests.Session()
     session.headers.update({"Authorization": f"Bearer {token}"})
     return session
@@ -101,13 +181,23 @@ def retry_delay(headers: Mapping[str, str] | None) -> int:
     return int((headers or {}).get("Retry-After", DEFAULT_RETRY_SECONDS))
 
 
+def wait(seconds: int) -> None:
+    """Sleep out a Graph throttle, counting it down on the progress display."""
+    log(f"Throttled by Graph, waiting {seconds}s", style="yellow")
+    task = PROGRESS.add_task("[yellow]Throttled, waiting (s)", total=seconds)
+    for _ in range(seconds):
+        time.sleep(1)
+        PROGRESS.advance(task)
+    PROGRESS.remove_task(task)
+
+
 def send(session: requests.Session, method: str, url: str, **kwargs: Any) -> requests.Response:  # noqa: ANN401
     """Send a Graph request, retrying throttled and transient failures."""
     for _ in range(MAX_ATTEMPTS - 1):
         resp = session.request(method, url, timeout=TIMEOUT, **kwargs)
         if resp.status_code not in RETRY_STATUSES:
             break
-        time.sleep(retry_delay(resp.headers))
+        wait(retry_delay(resp.headers))
     else:
         resp = session.request(method, url, timeout=TIMEOUT, **kwargs)
     resp.raise_for_status()
@@ -131,12 +221,11 @@ def resolve_group(session: requests.Session, group: str) -> dict[str, Any]:
     odata_filter = quote("displayName eq '{}'".format(group.replace("'", "''")), safe="")
     matches = list(paged(session, f"{GRAPH}/groups?$filter={odata_filter}&$select=id,displayName"))
     if len(matches) != 1:
-        msg = f"Expected exactly one group named {group!r}, found {len(matches)}"
-        raise SystemExit(msg)
+        fail(f"Expected exactly one group named {group!r}, found {len(matches)}")
     return matches[0]
 
 
-def fetch_users(session: requests.Session, ids: list[str]) -> dict[str, dict[str, Any]]:
+def fetch_users(session: requests.Session, ids: list[str]) -> tuple[dict[str, dict[str, Any]], bool]:
     """Fetch full user records (incl. signInActivity) via $batch, 20 at a time.
 
     signInActivity can't be selected on the group members endpoint, so each
@@ -145,15 +234,16 @@ def fetch_users(session: requests.Session, ids: list[str]) -> dict[str, dict[str
     Graph rejects the whole lookup with 403 if signInActivity isn't allowed
     (no P1/P2 licence, permission or role), so on the first 403 this drops
     signInActivity for the rest of the run rather than losing every user.
+
+    Returns the users by id and whether sign-in activity was available.
     """
     users: dict[str, dict[str, Any]] = {}
     select = USER_SELECT
-    log(f"Looking up details for {len(ids)} users")
-    for n, chunk in enumerate(batched(ids, BATCH_SIZE, strict=False), start=1):
+    task = PROGRESS.add_task("Looking up users", total=len(ids))
+    for chunk in batched(ids, BATCH_SIZE, strict=False):
         select = fetch_chunk(session, chunk, select, users)
-        if n % PROGRESS_EVERY == 0:
-            log(f"  {min(n * BATCH_SIZE, len(ids))}/{len(ids)} users looked up")
-    return users
+        PROGRESS.advance(task, len(chunk))
+    return users, select == USER_SELECT
 
 
 def fetch_chunk(
@@ -181,15 +271,15 @@ def fetch_chunk(
                 users[body["id"]] = body
             else:
                 pending.pop(r["id"])
-                log(f"Warning: user lookup failed: {err}")
+                warn(f"user lookup failed: {err}")
         if denied:
             select = USER_SELECT_BASIC
-            log(f"Warning: no sign-in activity, lastSignInDate left blank: {denied}")
+            warn(f"no sign-in activity, lastSignInDate left blank: {denied}")
         if not pending:
             return select
-        log(f"Throttled by Graph, waiting {retry_after}s")
-        time.sleep(retry_after)
-    log(f"Warning: {len(pending)} user lookups still throttled, giving up")
+        if retry_after:  # else only the signInActivity denials are pending
+            wait(retry_after)
+    warn(f"{len(pending)} user lookups still throttled, giving up")
     return select
 
 
@@ -206,16 +296,24 @@ def build_rows(
     group_id: str,
     *,
     transitive: bool,
-) -> list[dict[str, Any]]:
-    """Return one row per group member; user-only columns blank for others."""
+) -> tuple[list[dict[str, Any]], bool]:
+    """Return one row per group member, and whether sign-in activity was available.
+
+    User-only columns are left blank for members that aren't users.
+    """
     relation = "transitiveMembers" if transitive else "members"
     url = f"{GRAPH}/groups/{group_id}/{relation}?$select=id,displayName&$top=999"
-    members = list(paged(session, url))
+    task = PROGRESS.add_task("Listing members", total=None)
+    members = []
+    for m in paged(session, url):
+        members.append(m)
+        PROGRESS.advance(task)
+    PROGRESS.update(task, total=len(members))
 
     user_ids = [m["id"] for m in members if m.get("@odata.type") == "#microsoft.graph.user"]
     others = len(members) - len(user_ids)
     log(f"Found {len(members)} {'transitive ' if transitive else ''}members: {len(user_ids)} users, {others} other")
-    users = fetch_users(session, user_ids)
+    users, sign_ins = fetch_users(session, user_ids)
 
     rows = []
     for m in members:
@@ -231,7 +329,15 @@ def build_rows(
             row["lastSignInDate"] = sign_in_date(user) or ""
         rows.append(row)
 
-    return sorted(rows, key=lambda r: (r["type"], r["displayName"].casefold()))
+    return sorted(rows, key=lambda r: (r["type"], r["displayName"].casefold())), sign_ins
+
+
+def write_output(rows: list[dict[str, Any]], output: Path, fmt: str) -> None:
+    """Write rows to `output` in the chosen format."""
+    if fmt == "csv":
+        write_csv(rows, output)
+    else:
+        write_xlsx(rows, output)
 
 
 def write_csv(rows: list[dict[str, Any]], output: Path) -> None:
@@ -266,39 +372,53 @@ def write_xlsx(rows: list[dict[str, Any]], output: Path) -> None:
         ws.autofit(max_width=MAX_COL_PIXELS)
 
 
+def summarise(rows: list[dict[str, Any]], *, noun: str, sign_ins: bool, started: float) -> None:
+    """Print an end-of-run summary table of what was exported."""
+    users = [r for r in rows if r["type"] == "user"]
+    table = Table(title="Summary", title_justify="left", show_header=False)
+    table.add_column(style="bold")
+    table.add_column(justify="right")
+    table.add_row(noun.capitalize(), str(len(rows)))
+    if len(users) != len(rows):
+        table.add_row("Non-user members", str(len(rows) - len(users)))
+    guests = sum(r["accountType"] == "Guest" for r in users)
+    if guests != len(rows):
+        table.add_row("Guests", str(guests))
+    table.add_row("Enabled", str(sum(r["accountStatus"] == "Enabled" for r in users)), style="green")
+    table.add_row("Disabled", str(sum(r["accountStatus"] == "Disabled" for r in users)), style="red")
+    if sign_ins:
+        table.add_row("No sign-in recorded", str(sum(not r["lastSignInDate"] for r in users)), style="yellow")
+    else:
+        table.add_row("No sign-in recorded", "unavailable", style="dim")
+    table.add_row("Time taken", f"{time.monotonic() - started:.1f}s")
+    CONSOLE.print(table)
+
+
 def main() -> None:
     """Parse arguments and write the export."""
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = make_parser(__doc__)
     parser.add_argument("group", help="Group display name or object ID")
     parser.add_argument(
         "--transitive",
         action="store_true",
         help="Include members of nested groups",
     )
-    parser.add_argument(
-        "--format",
-        choices=["xlsx", "csv"],
-        default="xlsx",
-        help="Output format (default: xlsx)",
-    )
-    parser.add_argument("-o", "--output", type=Path, help="Output file path")
+    add_output_args(parser)
     args = parser.parse_args()
 
     started = time.monotonic()
     log(f"Started: exporting members of {args.group!r}")
-    session = graph_session()
-    group = resolve_group(session, args.group)
-    log(f"Found group {group['displayName']!r} ({group['id']})")
-    rows = build_rows(session, group["id"], transitive=args.transitive)
+    with running():
+        session = graph_session()
+        group = resolve_group(session, args.group)
+        log(f"Found group {group['displayName']!r} ({group['id']})")
+        rows, sign_ins = build_rows(session, group["id"], transitive=args.transitive)
 
     stem = re.sub(r"[^\w-]+", "_", args.group)
     output: Path = args.output or Path(f"{stem}_members.{args.format}")
-    if args.format == "csv":
-        write_csv(rows, output)
-    else:
-        write_xlsx(rows, output)
-
-    log(f"Wrote {len(rows)} members to {output} in {time.monotonic() - started:.1f}s")
+    write_output(rows, output, args.format)
+    log(f"Wrote {len(rows)} members to {output}", style="green")
+    summarise(rows, noun="members", sign_ins=sign_ins, started=started)
 
 
 if __name__ == "__main__":
