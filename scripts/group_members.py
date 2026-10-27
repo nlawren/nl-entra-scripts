@@ -51,6 +51,7 @@ from azure.identity import AzureCliCredential
 from rich.console import Console
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
+from rich.theme import Theme
 from rich_argparse import RawDescriptionRichHelpFormatter
 from xlsxwriter import Workbook
 
@@ -83,7 +84,8 @@ MAX_COL_PIXELS = 400
 
 # Everything goes to stderr, keeping stdout clean. Colour and live progress
 # switch themselves off when stderr isn't a terminal (piped or redirected).
-CONSOLE = Console(stderr=True, log_path=False, log_time_format="%H:%M:%S")
+# Timestamps in the normal text colour: rich's dim cyan is near-unreadable on dark themes.
+CONSOLE = Console(stderr=True, log_path=False, log_time_format="%H:%M:%S", theme=Theme({"log.time": "default"}))
 PROGRESS = Progress(
     SpinnerColumn(),
     TextColumn("{task.description}"),
