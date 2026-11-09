@@ -56,7 +56,7 @@ from rich_argparse import RawDescriptionRichHelpFormatter
 from xlsxwriter import Workbook
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterator, Mapping
+    from collections.abc import Generator, Iterator, Mapping, Sequence
 
 GRAPH = "https://graph.microsoft.com/v1.0"
 SCOPE = "https://graph.microsoft.com/.default"
@@ -246,6 +246,53 @@ def fetch_users(session: requests.Session, ids: list[str]) -> tuple[dict[str, di
     return users, select == USER_SELECT
 
 
+def batch_error(status: int, body: dict[str, Any]) -> str:
+    """Return Graph's own message for one failed $batch response."""
+    return body.get("error", {}).get("message", str(status))
+
+
+def batch_get(
+    session: requests.Session,
+    paths: Mapping[str, str],
+    select: str,
+) -> tuple[dict[str, tuple[int, dict[str, Any]]], str]:
+    """Send up to BATCH_SIZE GETs as one $batch, with `select` added to each.
+
+    `paths` maps the caller's own key to a relative Graph URL. Throttled requests
+    are retried, and on a 403 signInActivity is dropped (see fetch_users).
+
+    Returns each key's final (status, body) and the $select to use next. Keys
+    still throttled after MAX_ATTEMPTS are left out of the results.
+    """
+    pending = dict(paths)
+    results: dict[str, tuple[int, dict[str, Any]]] = {}
+    for _ in range(MAX_ATTEMPTS):
+        batch = [
+            {"id": key, "method": "GET", "url": f"{path}{'&' if '?' in path else '?'}$select={select}"}
+            for key, path in pending.items()
+        ]
+        resp = send(session, "POST", f"{GRAPH}/$batch", json={"requests": batch})
+        retry_after = 0
+        denied = ""
+        for r in resp.json()["responses"]:
+            body = r.get("body") or {}
+            if r["status"] in RETRY_STATUSES:
+                retry_after = max(retry_after, retry_delay(r.get("headers")))
+            elif r["status"] == HTTP_FORBIDDEN and select == USER_SELECT:
+                denied = batch_error(r["status"], body)  # left pending, retried without signInActivity
+            else:
+                pending.pop(r["id"])
+                results[r["id"]] = (r["status"], body)
+        if denied:
+            select = USER_SELECT_BASIC
+            warn(f"no sign-in activity, lastSignInDate left blank: {denied}")
+        if not pending:
+            break
+        if retry_after:  # else only the signInActivity denials are pending
+            wait(retry_after)
+    return results, select
+
+
 def fetch_chunk(
     session: requests.Session,
     chunk: tuple[str, ...],
@@ -253,33 +300,14 @@ def fetch_chunk(
     users: dict[str, dict[str, Any]],
 ) -> str:
     """Look up one $batch of users into `users`; return the $select to use next."""
-    pending = {str(i): uid for i, uid in enumerate(chunk)}
-    for _ in range(MAX_ATTEMPTS):
-        batch = [{"id": k, "method": "GET", "url": f"/users/{uid}?$select={select}"} for k, uid in pending.items()]
-        resp = send(session, "POST", f"{GRAPH}/$batch", json={"requests": batch})
-        retry_after = 0
-        denied = ""
-        for r in resp.json()["responses"]:
-            body = r.get("body") or {}
-            err = body.get("error", {}).get("message", r["status"])
-            if r["status"] in RETRY_STATUSES:
-                retry_after = max(retry_after, retry_delay(r.get("headers")))
-            elif r["status"] == HTTP_FORBIDDEN and select == USER_SELECT:
-                denied = err  # left pending, retried without signInActivity
-            elif r["status"] == requests.codes.ok:
-                pending.pop(r["id"])
-                users[body["id"]] = body
-            else:
-                pending.pop(r["id"])
-                warn(f"user lookup failed: {err}")
-        if denied:
-            select = USER_SELECT_BASIC
-            warn(f"no sign-in activity, lastSignInDate left blank: {denied}")
-        if not pending:
-            return select
-        if retry_after:  # else only the signInActivity denials are pending
-            wait(retry_after)
-    warn(f"{len(pending)} user lookups still throttled, giving up")
+    results, select = batch_get(session, {uid: f"/users/{uid}" for uid in chunk}, select)
+    for status, body in results.values():
+        if status == requests.codes.ok:
+            users[body["id"]] = body
+        else:
+            warn(f"user lookup failed: {batch_error(status, body)}")
+    if len(results) < len(chunk):
+        warn(f"{len(chunk) - len(results)} user lookups still throttled, giving up")
     return select
 
 
@@ -332,40 +360,40 @@ def build_rows(
     return sorted(rows, key=lambda r: (r["type"], r["displayName"].casefold())), sign_ins
 
 
-def write_output(rows: list[dict[str, Any]], output: Path, fmt: str) -> None:
+def write_output(rows: list[dict[str, Any]], output: Path, fmt: str, columns: Sequence[str] = COLUMNS) -> None:
     """Write rows to `output` in the chosen format."""
     if fmt == "csv":
-        write_csv(rows, output)
+        write_csv(rows, output, columns)
     else:
-        write_xlsx(rows, output)
+        write_xlsx(rows, output, columns)
 
 
-def write_csv(rows: list[dict[str, Any]], output: Path) -> None:
+def write_csv(rows: list[dict[str, Any]], output: Path, columns: Sequence[str]) -> None:
     """Write rows as plain CSV (dates as YYYY-MM-DD)."""
     # BOM so Excel reads the file as UTF-8 and doesn't garble non-ASCII names.
     with output.open("w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=COLUMNS)
+        writer = csv.DictWriter(f, fieldnames=columns)
         writer.writeheader()
         writer.writerows(rows)
 
 
-def write_xlsx(rows: list[dict[str, Any]], output: Path) -> None:
+def write_xlsx(rows: list[dict[str, Any]], output: Path, columns: Sequence[str]) -> None:
     """Write rows as an Excel table: filter buttons, banding, frozen header."""
     with Workbook(output) as wb:
         ws = wb.add_worksheet("Members")
         # Real dates so Excel sorts and filters them by date, not as text.
         date_fmt = wb.add_format({"num_format": "yyyy-mm-dd"})
-        columns = [{"header": c, "format": date_fmt} if c == "lastSignInDate" else {"header": c} for c in COLUMNS]
+        headers = [{"header": c, "format": date_fmt} if c == "lastSignInDate" else {"header": c} for c in columns]
         ws.add_table(
             0,
             0,
             max(len(rows), 1),  # header-only table still needs one (blank) row
-            len(COLUMNS) - 1,
+            len(columns) - 1,
             {
                 "name": "Members",
                 "style": "Table Style Medium 2",
-                "columns": columns,
-                "data": [[row[c] for c in COLUMNS] for row in rows],
+                "columns": headers,
+                "data": [[row[c] for c in columns] for row in rows],
             },
         )
         ws.freeze_panes(1, 0)
