@@ -8,6 +8,7 @@ requests run from the command line.
 | --- | --- |
 | [`group_members.py`](scripts/group_members.py) | Every member of a group, optionally including nested groups |
 | [`guest_users.py`](scripts/guest_users.py) | Every guest user from one email domain |
+| [`check_users.py`](scripts/check_users.py) | Whether each user listed in a CSV still exists and is enabled |
 
 ## Requirements
 
@@ -20,8 +21,8 @@ requests run from the command line.
   | Permission | Needed by |
   | --- | --- |
   | `GroupMember.Read.All` | `group_members.py` |
-  | `User.Read.All` | both |
-  | `AuditLog.Read.All` | both, for last sign-in dates |
+  | `User.Read.All` | all |
+  | `AuditLog.Read.All` | all, for last sign-in dates |
 
 Last sign-in dates also need an Entra ID P1/P2 licence in the tenant and a
 directory role such as Reports Reader, Security Reader or Global Reader. Without
@@ -29,8 +30,8 @@ them the scripts still run, show a warning, and leave `lastSignInDate` blank.
 
 ## Usage
 
-Run the scripts from the `scripts` folder. Both have `-h`/`--help`, which lists
-every option with examples.
+Run the scripts from the `scripts` folder. They all have `-h`/`--help`, which
+lists every option with examples.
 
 ### group_members.py
 
@@ -71,9 +72,43 @@ Guest user principal names look like
 mail address are still found. Only the exact domain matches: `example.com` won't
 match `a.example.com`.
 
+### check_users.py
+
+```sh
+uv run check_users.py powerapps_users.csv
+uv run check_users.py powerapps_users.csv --format csv
+uv run check_users.py powerapps_users.csv -o checked.xlsx
+```
+
+| Argument | Description |
+| --- | --- |
+| `csv` | CSV file listing the users to check |
+| `--format {xlsx,csv}` | Output format (default: `xlsx`) |
+| `-o`, `--output` | Output file path (default: `powerapps_users_checked.xlsx`, from the input file) |
+
+The CSV needs an `Object id` column, a `User principle name` column, or both. Any
+case works, and so does `User principal name`. Other columns are ignored. Save it
+as UTF-8, which Excel calls "CSV UTF-8".
+
+Each user is looked up by object ID, because that never changes, and then by user
+principal name if there's no usable ID or the ID isn't found. You get one output
+row per CSV row, with the accounts needing attention first and `accountStatus` set
+to one of:
+
+| `accountStatus` | Meaning |
+| --- | --- |
+| `Not found` | Graph confirmed there's no such account |
+| `Lookup failed` | Graph gave no answer, so the account may still exist; `notes` says why |
+| `Disabled` | The account exists and is disabled |
+| `Enabled` | The account exists and is enabled |
+
+An extra `notes` column flags a user principal name that has changed since the CSV
+was exported, or one that now belongs to a different account from the CSV's object
+ID. In that case the row describes the current account, not the one in the CSV.
+
 ## Output
 
-Both scripts write the same columns:
+All three scripts write the same columns, and `check_users.py` adds `notes`:
 
 | Column | Description |
 | --- | --- |
@@ -82,7 +117,7 @@ Both scripts write the same columns:
 | `userPrincipalName` | Sign-in name |
 | `mail` | Primary email address |
 | `accountType` | `Standard` or `Guest` |
-| `accountStatus` | `Enabled` or `Disabled` |
+| `accountStatus` | `Enabled` or `Disabled`, plus `Not found` and `Lookup failed` from `check_users.py` |
 | `lastSignInDate` | Date of the last *successful* sign-in, in Sydney time |
 | `id` | Entra object ID |
 
@@ -110,5 +145,5 @@ uv run ruff format --diff .
 uv run ty check
 ```
 
-`guest_users.py` imports its Graph helpers from `group_members.py`, so the two
-scripts need to stay in the same folder.
+`guest_users.py` and `check_users.py` import their Graph helpers from
+`group_members.py`, so the scripts need to stay in the same folder.
